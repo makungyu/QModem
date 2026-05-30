@@ -625,7 +625,13 @@ set_if()
                     protov6="dhcpv6"
                     ;;
                 "intel")
-                    proto="static"
+                    # NCM: static IP from AT+CGCONTRDP (verified). MBIM: quectel-CM-M
+                    # via mbim-proxy brings up wwan0, IP obtained over DHCP.
+                    if [ "$driver" = "ncm" ]; then
+                        proto="static"
+                    else
+                        proto="dhcp"
+                    fi
                     protov6="dhcpv6"
                     ;;
                 esac
@@ -986,6 +992,20 @@ mbim_dial(){
     if [ -z "$apn" ];then
         apn="auto"
     fi
+    # Intel XMM (L850/L860-GL): a raw cdc-wdm open wedges the modem's MBIM.
+    # Drive it via libmbim mbim-proxy. Probe with mbimcli first (spawns the
+    # proxy, opens the MBIM session and keeps it, waiting for it to be ready),
+    # then quectel-CM-M connects through the same proxy (-p mbim-proxy).
+    if [ "$platform" = "intel" ] && command -v mbimcli >/dev/null 2>&1; then
+        local wdm="/dev/cdc-wdm0"
+        [ -n "$modem_path" ] && { local w=$(find "$modem_path" -name 'cdc-wdm*' 2>/dev/null | head -1); [ -n "$w" ] && wdm="/dev/$(basename "$w")"; }
+        local i=0
+        while [ $i -lt 12 ]; do
+            mbimcli -d "$wdm" -p --query-device-caps --no-close >/dev/null 2>&1 && break
+            i=$((i+1)); sleep 5
+        done
+        mbim_proxy_flag="-p mbim-proxy"
+    fi
     qmi_dial
 }
 
@@ -1047,6 +1067,7 @@ qmi_dial()
     else
         [ -n "$metric" ] && cmd_line="$cmd_line"
     fi
+    [ -n "$mbim_proxy_flag" ] && cmd_line="$cmd_line $mbim_proxy_flag"
     cmd_line="$cmd_line -f $log_file"
     while true; do
         m_debug "dialing: $cmd_line"

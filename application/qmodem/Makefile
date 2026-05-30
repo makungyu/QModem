@@ -25,6 +25,7 @@ define Package/$(PKG_NAME)
 		+kmod-usb-net-cdc-ncm +kmod-usb-net-huawei-cdc-ncm \
   		+ubus-at-daemon +tom_modem +terminfo +sms-tool_q \
 		+modem_scan \
+		+mbim-utils \
 		+jq +bc\
 		+coreutils +coreutils-stat \
 		+usbutils \
