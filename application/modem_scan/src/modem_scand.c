@@ -592,9 +592,14 @@ static void scan_usb_slot(const char *slot, struct scan_result *res)
 		    !strcmp(driver, "qcserial") || !strcmp(driver, "usbserial_generic") ||
 		    !strcmp(driver, "usbserial")) {
 			struct str_list ttys;
+			char tty_dir[600];
 			sl_init(&ttys);
 			list_child_matching(path, "ttyUSB", &ttys);
 			list_child_matching(path, "ttyACM", &ttys);
+			/* cdc_acm exposes the node under <iface>/tty/ttyACMx */
+			snprintf(tty_dir, sizeof(tty_dir), "%s/tty", path);
+			list_child_matching(tty_dir, "ttyUSB", &ttys);
+			list_child_matching(tty_dir, "ttyACM", &ttys);
 			for (size_t i = 0; i < ttys.len; i++) {
 				char dev[160];
 				snprintf(dev, sizeof(dev), "/dev/%s", ttys.items[i]);
