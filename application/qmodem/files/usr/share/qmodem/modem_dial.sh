@@ -625,14 +625,14 @@ set_if()
                     protov6="dhcpv6"
                     ;;
                 "intel")
-                    # NCM: static IP from AT+CGCONTRDP (verified). MBIM: quectel-CM-M
-                    # via mbim-proxy brings up wwan0, IP obtained over DHCP.
+                    # XMM L850/L860: v4 is set statically (NCM via CGCONTRDP,
+                    # MBIM via mbimcli). NCM keeps DHCPv6; MBIM disables v6 (raw-ip).
+                    proto="static"
                     if [ "$driver" = "ncm" ]; then
-                        proto="static"
+                        protov6="dhcpv6"
                     else
-                        proto="dhcp"
+                        protov6="none"
                     fi
-                    protov6="dhcpv6"
                     ;;
                 esac
             ;;
@@ -992,21 +992,74 @@ mbim_dial(){
     if [ -z "$apn" ];then
         apn="auto"
     fi
-    # Intel XMM (L850/L860-GL): a raw cdc-wdm open wedges the modem's MBIM.
-    # Drive it via libmbim mbim-proxy. Probe with mbimcli first (spawns the
-    # proxy, opens the MBIM session and keeps it, waiting for it to be ready),
-    # then quectel-CM-M connects through the same proxy (-p mbim-proxy).
+    # Intel XMM (L850/L860-GL): quectel-CM's own MBIM CONNECT is rejected by the
+    # XMM firmware (status 9), while libmbim's CONNECT works fine. So drive the
+    # data session with mbimcli (via mbim-proxy) and configure the raw-ip netdev.
     if [ "$platform" = "intel" ] && command -v mbimcli >/dev/null 2>&1; then
-        local wdm="/dev/cdc-wdm0"
-        [ -n "$modem_path" ] && { local w=$(find "$modem_path" -name 'cdc-wdm*' 2>/dev/null | head -1); [ -n "$w" ] && wdm="/dev/$(basename "$w")"; }
-        local i=0
-        while [ $i -lt 12 ]; do
-            mbimcli -d "$wdm" -p --query-device-caps --no-close >/dev/null 2>&1 && break
-            i=$((i+1)); sleep 5
-        done
-        mbim_proxy_flag="-p mbim-proxy"
+        mbim_dial_intel
+        return
     fi
     qmi_dial
+}
+
+mbim_dial_intel()
+{
+    mbim_wdm="/dev/cdc-wdm0"
+    [ -n "$modem_path" ] && { local w=$(find "$modem_path" -name 'cdc-wdm*' 2>/dev/null | head -1); [ -n "$w" ] && mbim_wdm="/dev/$(basename "$w")"; }
+    # readiness probe (also spawns mbim-proxy and opens the session via libmbim)
+    local i=0
+    while [ $i -lt 24 ]; do
+        mbimcli -d "$mbim_wdm" -p --query-device-caps --no-close >/dev/null 2>&1 && break
+        i=$((i+1)); sleep 5
+    done
+    mbimcli -d "$mbim_wdm" -p --disconnect --no-close >/dev/null 2>&1
+    local j=0
+    while [ $j -lt 3 ]; do
+        mbim_connect_intel && break
+        j=$((j+1)); sleep 5
+    done
+    while true; do
+        sleep 20
+        if ! mbimcli -d "$mbim_wdm" -p --query-connection-state --no-close 2>/dev/null | grep -q "'activated'"; then
+            m_debug "MBIM session down, reconnecting"
+            mbim_connect_intel
+        fi
+        check_logfile_line
+    done
+}
+
+mbim_connect_intel()
+{
+    local apn_use out v4 v4ip v4gw v4dns1 v4dns2 dev
+    local public_dns1_ipv4="223.5.5.5"
+    local public_dns2_ipv4="119.29.29.29"
+    apn_use="$apn"
+    if [ -z "$apn_use" ] || [ "$apn_use" = "auto" ]; then
+        apn_use=$(at ${at_port} "AT+CGDCONT?" | grep "+CGDCONT: $pdp_index," | head -1 | awk -F, '{print $3}' | tr -d '"\r ')
+    fi
+    m_debug "mbim connect apn='$apn_use' dev=$mbim_wdm"
+    out=$(mbimcli -d "$mbim_wdm" -p --connect="apn=$apn_use" --no-close 2>&1)
+    v4=$(echo "$out" | sed -n '/IPv4 configuration/,/IPv6 configuration/p')
+    [ -z "$v4" ] && v4=$(echo "$out" | sed -n '/IPv4 configuration/,$p')
+    v4ip=$(echo "$v4" | grep "IP \[0\]:" | head -1 | awk -F"'" '{print $2}')
+    v4gw=$(echo "$v4" | grep "Gateway:" | head -1 | awk -F"'" '{print $2}')
+    v4dns1=$(echo "$v4" | grep "DNS \[0\]:" | head -1 | awk -F"'" '{print $2}')
+    v4dns2=$(echo "$v4" | grep "DNS \[1\]:" | head -1 | awk -F"'" '{print $2}')
+    echo "$v4ip" | grep -qE '^[0-9.]+/[0-9]+$' || { m_debug "mbim connect: no IPv4 ($(echo "$out" | tail -1))"; return 1; }
+    [ -z "$v4dns1" ] && v4dns1="$public_dns1_ipv4"
+    [ -z "$v4dns2" ] && v4dns2="$public_dns2_ipv4"
+    uci set network.${interface_name}.proto='static'
+    uci set network.${interface_name}.ipaddr="${v4ip}"
+    [ -n "$v4gw" ] && uci set network.${interface_name}.gateway="${v4gw}"
+    uci set network.${interface_name}.peerdns='0'
+    uci -q del network.${interface_name}.dns
+    uci add_list network.${interface_name}.dns="${v4dns1}"
+    uci add_list network.${interface_name}.dns="${v4dns2}"
+    uci commit network
+    ifup ${interface_name}
+    dev=$(uci -q get network.${interface_name}.device)
+    [ -n "$dev" ] && ip link set dev "$dev" arp off 2>/dev/null
+    m_debug "mbim set $interface_name to $v4ip gw $v4gw dns $v4dns1,$v4dns2"
 }
 
 mhi_dial()
@@ -1067,7 +1120,6 @@ qmi_dial()
     else
         [ -n "$metric" ] && cmd_line="$cmd_line"
     fi
-    [ -n "$mbim_proxy_flag" ] && cmd_line="$cmd_line $mbim_proxy_flag"
     cmd_line="$cmd_line -f $log_file"
     while true; do
         m_debug "dialing: $cmd_line"
